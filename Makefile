@@ -13,7 +13,7 @@ CPPFLAGS= ${CFLAGS}
 all: sbc
 
 sbc: sbc.o
-	$(CC) sbc.o -o sbc $(LDFLAGS) $(LDLIBS)
+	$(CC) sbc.o -o sbc -L./vector -lCOLLECTIONS $(LDFLAGS) $(LDLIBS)
 
 sbc.o: sbc.c
 	$(CC) -c -g $(CFLAGS) sbc.c

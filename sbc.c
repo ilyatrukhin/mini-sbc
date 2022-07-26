@@ -6,11 +6,14 @@
 
 pj_caching_pool          cash_pool;      /* Global pool factory */
 pjsip_endpoint           *g_endpt;       /* SIP endpoint        */
+pjmedia_endpt	    *g_med_endpt;   /* Media endpoint.		*/
 
 int next_call_id = 0;		/**< Next call id to use*/
 pj_mutex_t		*mutex;	    /**< Mutex protection for this data	*/
 unsigned		 mutex_nesting_level; /**< Mutex nesting level.	*/
 pj_thread_t		*mutex_owner; /**< Mutex owner.			*/
+
+char *visible_nick = "<sip:vlbrazhnikov@10.25.72.40:7777>";
 
 
 PJ_INLINE(void) PJCUSTOM_LOCK()
@@ -34,21 +37,14 @@ PJ_INLINE(pj_bool_t) PJCUSTOM_LOCK_IS_LOCKED()
 
 
 
-typedef struct sbc_data { 
-    /* Call variables */
-    pjsip_inv_session        *g_inv;         /* Current invite session A <-> SBC */
-    pjsip_inv_session        *g_out;         /* SBC <-> B side */
-    pjsip_transport          *p_transport_a; 
-    pjsip_transport          *p_transport_b;
-    pjsip_rx_data            *new_rdata;
-    int                      call_id;
-    pj_bool_t                is_busy;
-} sbc_data;
+sbc_data *sbc_var = NULL;               // указатель на глобальный массив, содержащий 
+                                        // сведения о сессиях и транспортном уровне каждого 
+                                        // вызова, а также выдленный индекс call_id      
 
-sbc_data *sbc_var = NULL;
+static vector call_id_table;
 
+dlg_addr_data *dlg_addresses = NULL;
 
-static int alloc_call_id(void);
 
 
 /* Init PJSIP module to be registered by application to handle
@@ -93,7 +89,6 @@ int
 main()
 {
     pj_status_t status; 
-    sbc_var = (sbc_data*)malloc(sizeof(sbc_data) * SBC_DLG_MAX_CNT);
 
     /* init application */
     status = main_init();
@@ -125,6 +120,15 @@ main()
 static pj_status_t main_init(void)
 {
     pj_status_t status; 
+    pj_pool_t *pool = NULL;
+
+    sbc_var = (sbc_data*)malloc(sizeof(sbc_data) * SBC_DLG_MAX_CNT);
+   
+    vector_init(&call_id_table);
+
+    status = address_init();
+    if (status != PJ_SUCCESS)
+        sbc_perror(THIS_FILE, "Error in address_init()",status);
 
     status = sbc_init();
     if (status != PJ_SUCCESS)
@@ -144,6 +148,9 @@ static pj_status_t main_init(void)
     status = sbc_invite_mod_create();
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
 
+    /* Initialize 100rel support */
+    status = pjsip_100rel_init_module(g_endpt);
+    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
     /* 
      * Init transaction layer.
      * This will create/initialize transaction hash tables etc.
@@ -170,9 +177,49 @@ static pj_status_t main_init(void)
     status = pjsip_endpt_register_module(g_endpt, &mod_sbc);
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
 
+    status = pjmedia_endpt_create(&cash_pool.factory, NULL, 1, &g_med_endpt);
+    /* Create pool. */
+    pool = pjmedia_endpt_create_pool(g_med_endpt, "Media pool", 512, 512);	
+
+        /* Create mutex */
+    status = pj_mutex_create_recursive(pool, "simple_pjsip", 
+				       &mutex);
+    if (status != PJ_SUCCESS) {
+        pj_log_pop_indent();
+        sbc_perror(THIS_FILE, "Unable to create mutex", status);
+        /* Destroy mutex */
+        if (mutex) {
+            pj_mutex_destroy(mutex);
+            mutex = NULL;
+        }
+        return status;
+    }
+
     return status;
 }
 
+static pj_status_t address_init(void) {
+    dlg_addresses = (dlg_addr_data*)malloc(sizeof(dlg_addr_data) * 2);
+    if (!dlg_addresses) {
+        perror("malloc");
+        return 1;
+    }
+
+    strcpy(dlg_addresses[0].uas_addr, "10.25.72.30");
+    strcpy(dlg_addresses[0].uac_addr, "10.25.72.40");
+    strcpy(dlg_addresses[0].route_addr, "<sip:1133@10.25.72.100:5062>");
+    dlg_addresses[0].sbc_port = 7777;
+    dlg_addresses[0].rtp_port = 8000;
+
+    strcpy(dlg_addresses[1].uas_addr, "10.25.72.30");
+    strcpy(dlg_addresses[1].uac_addr, "10.25.72.60");
+    //strcpy(dlg_addresses[1].route_addr, "<sip:ilya@10.25.72.27:5060>");
+    strcpy(dlg_addresses[1].route_addr, "<sip:1133@10.25.72.100:5062>");
+    dlg_addresses[1].sbc_port = 8777;
+    dlg_addresses[1].rtp_port = 9000;
+
+    return PJ_SUCCESS;
+}
 /* init application data */
 static pj_status_t sbc_init(void)
 {
@@ -228,41 +275,42 @@ static pj_status_t sbc_global_endpt_create(void)
 static pj_status_t sbc_hidden_udp_transport_topology_create(void)
 {
     pj_status_t     status;
-    pj_sockaddr     addr_a, addr_b;
-    pj_int32_t      af = AF;
-    pj_str_t        str_sbc_uas = pj_str("10.25.72.28");
-    pj_str_t        str_sbc_uac = pj_str("10.25.72.29");
+    for (int i = 0; i < MAX_DLG_CNT; ++i) {
+        pj_sockaddr     addr_a, addr_b;
+        pj_int32_t      af = AF;
+        pj_str_t        str_sbc_uas = pj_str(dlg_addresses[i].uas_addr);
+        pj_str_t        str_sbc_uac = pj_str(dlg_addresses[i].uac_addr);
 
-    /* Socket init */
-    status = pj_sockaddr_init(af, &addr_a, &str_sbc_uas, (pj_uint16_t)SBC_PORT);
-    if (status != PJ_SUCCESS)
-    {
-        PJ_LOG(3, (THIS_FILE, "Check that sub_net is up\n"));
-        sbc_perror(THIS_FILE, "Unable init second socket\n", status);
-    }
-    
-    status = pjsip_udp_transport_start(g_endpt, &addr_a.ipv4, NULL, 1, &sbc_var[0].p_transport_a);
-    if (status != PJ_SUCCESS)
-    {
-        sbc_perror(THIS_FILE, "Unable to start UDP transport", status);
-    }
+        /* Socket init */
+        status = pj_sockaddr_init(af, &addr_a, &str_sbc_uas, (pj_uint16_t)dlg_addresses[i].sbc_port);
+        if (status != PJ_SUCCESS)
+        {
+            PJ_LOG(3, (THIS_FILE, "Check that sub_net is up\n"));
+            sbc_perror(THIS_FILE, "Unable init second socket\n", status);
+        }
+        
+        status = pjsip_udp_transport_start(g_endpt, &addr_a.ipv4, NULL, 1, &sbc_var[i].p_transport_a);
+        if (status != PJ_SUCCESS)
+        {
+            sbc_perror(THIS_FILE, "Unable to start UDP transport", status);
+        }
 
-    /*
-     * Create sub_network for hide topology
-     */
-    status = pj_sockaddr_init(af, &addr_b, &str_sbc_uac, (pj_uint16_t)(SBC_PORT + 2));
-    if (status != PJ_SUCCESS)
-    {
-        PJ_LOG(3, (THIS_FILE, "Check that sub_net is up\n"));
-        sbc_perror(THIS_FILE, "Unable init second socket\n", status);
-    }
+        /*
+        * Create sub_network for hide topology
+        */
+        status = pj_sockaddr_init(af, &addr_b, &str_sbc_uac, (pj_uint16_t)(dlg_addresses[i].sbc_port + 2));
+        if (status != PJ_SUCCESS)
+        {
+            PJ_LOG(3, (THIS_FILE, "Check that sub_net is up\n"));
+            sbc_perror(THIS_FILE, "Unable init second socket\n", status);
+        }
 
-    status = pjsip_udp_transport_start(g_endpt, &addr_b.ipv4, NULL, 1, &sbc_var[0].p_transport_b);
-    if (status != PJ_SUCCESS)
-    {
-        sbc_perror(THIS_FILE, "Unable to start SECOND UDP transport", status);
+        status = pjsip_udp_transport_start(g_endpt, &addr_b.ipv4, NULL, 1, &sbc_var[i].p_transport_b);
+        if (status != PJ_SUCCESS)
+        {
+            sbc_perror(THIS_FILE, "Unable to start SECOND UDP transport", status);
+        }
     }
-
     return status;
 }
 
@@ -290,6 +338,7 @@ static pj_status_t sbc_invite_mod_create(void)
     pj_bzero(&inv_cb, sizeof(inv_cb));
     inv_cb.on_state_changed = &call_on_state_changed;
     inv_cb.on_new_session = &call_on_forked;
+    inv_cb.on_media_update = &call_on_media_update;
 
     /* Initialize invite session module:  */
     status = pjsip_inv_usage_init(g_endpt, &inv_cb);
@@ -310,16 +359,12 @@ static pj_bool_t sbc_invite_handler(pjsip_rx_data *rdata)
     pjsip_dialog        *uas_dlg;
     pjsip_tpselector    new_sel;
 
-    /*
-     * Save rdata for response?
-     */
-    status = pjsip_rx_data_clone(rdata, 0, &sbc_var[0].new_rdata);
-    if (status != PJ_SUCCESS)
-        sbc_perror(THIS_FILE, "FAILED CLONE RX", status);
+    
 
     /* 
      * Respond (statelessly) any non-INVITE requests with 500 
      */
+
     if (rdata->msg_info.msg->line.req.method.id != PJSIP_INVITE_METHOD) 
     {
         if (rdata->msg_info.msg->line.req.method.id != PJSIP_ACK_METHOD) 
@@ -330,21 +375,47 @@ static pj_bool_t sbc_invite_handler(pjsip_rx_data *rdata)
         }
         return PJ_TRUE;
     }
+   
+    PJCUSTOM_LOCK();
 
-    /*
-     * Reject INVITE if we already have an INVITE session in progress.
-     */
-    if (sbc_var[0].g_inv)
-    { 
-        pj_str_t reason = pj_str("Another call is in progress");
+    // Find free call slot
+    int call_id = alloc_call_id();
+
+    if (call_id == INVALID_ID) {
+        pjsip_endpt_respond_stateless(g_endpt, rdata,
+                        PJSIP_SC_BUSY_HERE, NULL,
+                        NULL, NULL);
+        PJ_LOG(2,(THIS_FILE,
+            "Unable to accept incoming call (too many calls)"));
+        pj_str_t reason = pj_str("Unable to accept incoming call (too many calls)");
         pjsip_endpt_respond_stateless(g_endpt, rdata, 500, &reason,
                            NULL, NULL);
         return PJ_TRUE;
     }
 
+    call_id_data *new_cid = (call_id_data*)malloc(sizeof(call_id_data));
+    new_cid->int_call_id = call_id;
+    str_malloc(rdata->msg_info.cid->id, &new_cid->sip_call_id_a, rdata->msg_info.cid->id.slen);
+    new_cid->sip_call_id_b = NULL;
+    vector_pushback(&call_id_table, new_cid);
+
+    
+
+    sbc_data *call = &sbc_var[call_id];
+
+    call->call_id = call_id;
+    rdata->endpt_info.mod_data[0] = call;
+
+    /*
+     * Send INVITE to other side //add if()
+     */
+
+    sbc_request_inv_send(rdata, call_id);    
+    
     /* 
      * Verify that we can handle the request 
      */
+
     status = pjsip_inv_verify_request(rdata, &options, NULL, NULL,
                                     g_endpt, NULL);
     if (status != PJ_SUCCESS) 
@@ -356,13 +427,18 @@ static pj_bool_t sbc_invite_handler(pjsip_rx_data *rdata)
     }
 
     /*
+     * Save rdata for response?
+     */
+
+    status = pjsip_rx_data_clone(rdata, 0, &call->new_rdata);
+    if (status != PJ_SUCCESS)
+        sbc_perror(THIS_FILE, "FAILED CLONE RX", status);
+
+    /*
      * Get host URI
      */
-    // if (pj_gethostip(AF, &hostaddr) != PJ_SUCCESS)
-    //     sbc_perror(THIS_FILE, "Unable to retrieve local host IP", status);
-    // pj_sockaddr_print(&hostaddr, hostip, sizeof(hostip), 2);
-    // pj_ansi_sprintf(temp, "<sip:sbc@%s:%d>", hostip, SBC_PORT);
-    local_uri = pj_str(/*temp*/"<sip:sbc@10.25.72.100:7777>");
+
+    local_uri = pj_str(/*temp*/"<sip:abc@10.25.72.30:7777>");
     PJ_LOG(3, (THIS_FILE, "UAS IP addr: %s, \n", local_uri));
 
     /*
@@ -376,14 +452,11 @@ static pj_bool_t sbc_invite_handler(pjsip_rx_data *rdata)
                           NULL, NULL);
         sbc_perror(THIS_FILE, "shutdown application", status);
     }
-
-    /*
-     * Set transport for UAS
-     */
     
     /*
      * Add application module to dialog usages
      */
+
     status = pjsip_dlg_add_usage(uas_dlg, &mod_sbc, NULL);
     if (status != PJ_SUCCESS)
     {
@@ -394,7 +467,8 @@ static pj_bool_t sbc_invite_handler(pjsip_rx_data *rdata)
     /* 
      * Create invite session, and pass both the UAS dialog
      */
-    status = pjsip_inv_create_uas( uas_dlg, rdata, NULL, 0, &sbc_var[0].g_inv);
+
+    status = pjsip_inv_create_uas( uas_dlg, rdata, NULL, 0, &call->g_inv);
     pj_assert(status == PJ_SUCCESS);
     if (status != PJ_SUCCESS) 
     {
@@ -405,8 +479,9 @@ static pj_bool_t sbc_invite_handler(pjsip_rx_data *rdata)
     /*
      * Set UDP transport for UAS
      */
+
     new_sel.type = PJSIP_TPSELECTOR_TRANSPORT;
-    new_sel.u.transport = sbc_var[0].p_transport_a;
+    new_sel.u.transport = call->p_transport_a;
 
     pjsip_tpselector_add_ref(&new_sel);
     status = pjsip_dlg_set_transport(uas_dlg, &new_sel);
@@ -417,31 +492,33 @@ static pj_bool_t sbc_invite_handler(pjsip_rx_data *rdata)
     /*
      * Get SDP body
      */ 
+
     pjsip_rdata_sdp_info *sdp_info;
     sdp_info = pjsip_rdata_get_sdp_info(rdata);
 
     /*
      * Set local SDP offer / answer for g_inv
      */
-    status = pjsip_inv_set_local_sdp(sbc_var[0].g_inv, sdp_info->sdp);
+
+    status = pjsip_inv_set_local_sdp(call->g_inv, sdp_info->sdp);
     if (status != PJ_SUCCESS)
         sbc_perror(THIS_FILE, "Error local_SDP\n", status);
 
     /*
      * Initially first response & send 100 trying
      */
-    status = pjsip_inv_initial_answer(sbc_var[0].g_inv, rdata, PJSIP_SC_TRYING, NULL, NULL, &p_tdata);
+
+    status = pjsip_inv_initial_answer(call->g_inv, rdata, PJSIP_SC_TRYING, NULL, NULL, &p_tdata);
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, PJ_TRUE);
 
 
     /* Send the 100 response. */  
-    status = pjsip_inv_send_msg(sbc_var[0].g_inv, p_tdata); 
+    status = pjsip_inv_send_msg(call->g_inv, p_tdata); 
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, PJ_TRUE);
 
-    /*
-     * Send INVITE to other side //add if()
-     */
-    sbc_request_inv_send(rdata);
+    call->g_inv->mod_data[0] = call;
+
+    PJCUSTOM_UNLOCK();
 
     return PJ_TRUE;
 }
@@ -449,31 +526,34 @@ static pj_bool_t sbc_invite_handler(pjsip_rx_data *rdata)
 /*
  * SBC routing to other network interface
  */
-static pj_bool_t sbc_request_inv_send(pjsip_rx_data *rdata)
+static pj_bool_t sbc_request_inv_send(pjsip_rx_data *rdata, int call_id)
 {
     pj_status_t         status;
     pjsip_tx_data       *p_tdata;
-    pjsip_dialog        *uac_dlg;
-    // pj_sock_t           sock_sent;
-    // pjsip_host_port     new_host;
+    pjsip_dialog        *uac_dlg = NULL;
     pjsip_tpselector    tp_sel;
 
     /*
      * Set route to direct for SBC
      */
-    // pj_str_t            local_uri = pj_str("<sip:sbc@10.25.72.110:7779>");
-    // pj_str_t            dest_uri  = pj_str("<sip:winehouse@10.25.72.75:5062>");
-    // pj_str_t            contact_uri = pj_str("<sip:sbc@10.25.72.110:7779>");
-    pj_str_t            local_uri = pj_str("<sip:vlbrazhnikov@10.25.72.130:7777>");
-    pj_str_t            dest_uri = pj_str(ROUTE_ADDR);
+
+    
+    //pj_str_t            local_uri = pj_str("<sip:vlbrazhnikov@10.25.72.40:7777>");
+    pj_str_t            local_uri = pj_str(visible_nick);
+    pj_str_t            dest_uri = pj_str(dlg_addresses[call_id].route_addr);
+
+    sbc_data *call = (sbc_data*) rdata->endpt_info.mod_data[0];
 
     /*
      * Add new UDP transport ot TP_SELECTOR
      */
-    tp_sel.type = PJSIP_TPSELECTOR_TRANSPORT;
-    tp_sel.u.transport = sbc_var[0].p_transport_b;
 
-    status = pjsip_dlg_create_uac(pjsip_ua_instance(), 
+    tp_sel.type = PJSIP_TPSELECTOR_TRANSPORT;
+    tp_sel.u.transport = call->p_transport_b;
+
+    pjsip_user_agent *agent = pjsip_ua_instance();
+ 
+    status = pjsip_dlg_create_uac(agent, 
                         &local_uri,
                         &local_uri,
                         &dest_uri,
@@ -487,6 +567,7 @@ static pj_bool_t sbc_request_inv_send(pjsip_rx_data *rdata)
     /*
      * Bind dialog to a specific transport 
      */
+
     status = pjsip_dlg_set_transport(uac_dlg, &tp_sel);
     if (status != PJ_SUCCESS)
         sbc_perror(THIS_FILE, "Unable set new transport for UAC", status);
@@ -494,6 +575,7 @@ static pj_bool_t sbc_request_inv_send(pjsip_rx_data *rdata)
     /*
      * Add application module to dialog usages
      */
+
     status = pjsip_dlg_add_usage(uac_dlg, &mod_sbc, NULL);
     if (status != PJ_SUCCESS)
     {
@@ -504,41 +586,60 @@ static pj_bool_t sbc_request_inv_send(pjsip_rx_data *rdata)
     /* 
      * Create the INVITE session for B side
      */
-    status = pjsip_inv_create_uac(uac_dlg, NULL, 0, &sbc_var[0].g_out);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
 
+    status = pjsip_inv_create_uac(uac_dlg, NULL, 0, &sbc_var[call_id].g_out);
+    PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
+    
     /*
      * Get SDP body
      */ 
+
     pjsip_rdata_sdp_info *sdp_info;
     sdp_info = pjsip_rdata_get_sdp_info(rdata);
 
     /*
      * Set local SDP offer / answer for g_out
      */
-    status = pjsip_inv_set_local_sdp(sbc_var[0].g_out, sdp_info->sdp);
+
+    status = pjsip_inv_set_local_sdp(call->g_out, sdp_info->sdp);
     if (status != PJ_SUCCESS)
         sbc_perror(THIS_FILE, "Error local_SDP\n", status);
+
+    PJCUSTOM_LOCK();
+
+    call_id_data *cid = (call_id_data*) vector_search_by_int_call_id(&call_id_table, call_id);
+
+    if (cid != NULL) {
+        if (cid->sip_call_id_b == NULL) {
+            str_malloc(uac_dlg->call_id->id, &cid->sip_call_id_b, uac_dlg->call_id->id.slen);
+        }
+    }
+
+    PJCUSTOM_UNLOCK();
 
     /*
      * Create INVITE request 
      */
-    status = pjsip_inv_invite(sbc_var[0].g_out, &p_tdata);
+
+    status = pjsip_inv_invite(call->g_out, &p_tdata);
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
 
     /*
      * Send INVITE to B
      */
-    status = pjsip_inv_send_msg(sbc_var[0].g_out, p_tdata);
+
+    status = pjsip_inv_send_msg(call->g_out, p_tdata);
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
 
+    //sbc_var[call_id].g_out->mod_data[0] = (sbc_data*)&sbc_var[call_id];
+    call->g_out->mod_data[0] = call;
     return PJ_TRUE;
 }
 
 /*
  * SBC send response to B side
  */
-static pj_bool_t sbc_response_code_send(pjsip_rx_data * rdata, unsigned code)
+static pj_bool_t sbc_response_code_send(pjsip_rx_data * rdata, unsigned code, int call_id)
 {
     pj_status_t                 status;
     pjsip_tx_data               *p_tdata;
@@ -552,9 +653,9 @@ static pj_bool_t sbc_response_code_send(pjsip_rx_data * rdata, unsigned code)
        4) create response for session
        5) send response for session
      */
-    status = pjsip_inv_initial_answer(sbc_var[0].g_inv, sbc_var[0].new_rdata, code, NULL, NULL, &p_tdata);
+    status = pjsip_inv_initial_answer(sbc_var[call_id].g_inv, sbc_var[call_id].new_rdata, code, NULL, NULL, &p_tdata);
     if (status != PJ_SUCCESS)
-        sbc_perror(THIS_FILE, "WHAT A FUCK", status);
+        sbc_perror(THIS_FILE, "Error in pjsip_inv_initial_answer", status);
 
     if (code == PJSIP_SC_OK)
     {
@@ -566,7 +667,7 @@ static pj_bool_t sbc_response_code_send(pjsip_rx_data * rdata, unsigned code)
             sbc_perror(THIS_FILE, "Error in create_sdp_body", status);
 
         /* set new body */
-        pj_size_t size = 100;
+        pj_size_t size = 400;
         char buf[size];
         p_tdata->msg->body = p_body;
         p_tdata->msg->body->print_body(p_tdata->msg->body, buf, size);
@@ -575,12 +676,13 @@ static pj_bool_t sbc_response_code_send(pjsip_rx_data * rdata, unsigned code)
         /*
          * Free cloned rdata for UAS
          */
-        status = pjsip_rx_data_free_cloned(sbc_var[0].new_rdata);
+        status = pjsip_rx_data_free_cloned(sbc_var[call_id].new_rdata);
         if (status != PJ_SUCCESS)
             sbc_perror(THIS_FILE, "RX not FREE!", status);
     }
 
-    status = pjsip_inv_send_msg(sbc_var[0].g_inv, p_tdata);
+    // Send response to A side
+    status = pjsip_inv_send_msg(sbc_var[call_id].g_inv, p_tdata);
 
     return PJ_TRUE;
 }
@@ -596,7 +698,6 @@ static pj_bool_t on_rx_request( pjsip_rx_data *rdata )
         case PJSIP_INVITE_METHOD:
             sbc_invite_handler(rdata);
             break;
-        
         default:
             PJ_LOG(3, (THIS_FILE, "default \n"));
             break;
@@ -611,27 +712,50 @@ static pj_bool_t on_rx_response( pjsip_rx_data *rdata)
 {
     unsigned        response_code = rdata->msg_info.msg->line.status.code;
     PJ_LOG(3, (THIS_FILE, "Should check rdata in on_rx_response!\n"));
+    
+    PJCUSTOM_LOCK();
 
-    if (sbc_var[0].g_inv != NULL)
-    {
-        switch(response_code)
+    int call_id = -1;
+    char *sip_call_id = (char*)malloc(sizeof(char)*(rdata->msg_info.cid->id.slen + 1));
+    strncpy(sip_call_id, rdata->msg_info.cid->id.ptr, rdata->msg_info.cid->id.slen);
+    sip_call_id[rdata->msg_info.cid->id.slen] = '\0';
+
+    call_id_data *cid = (call_id_data*) vector_search_by_sip_call_id(&call_id_table, sip_call_id);
+
+    if (cid != NULL) {
+        call_id = cid->int_call_id;
+    }
+
+    //free(sip_call_id);
+    //sip_call_id = NULL;
+
+    PJCUSTOM_UNLOCK();
+
+    if (call_id != -1) {
+        if (sbc_var[call_id].g_inv != NULL)
         {
-            case PJSIP_SC_RINGING:
-                sbc_response_code_send(rdata, PJSIP_SC_RINGING);
-                break;
+            switch(response_code)
+            {
+                case PJSIP_SC_RINGING:
+                    sbc_response_code_send(rdata, PJSIP_SC_RINGING, call_id);
+                    break;
 
-            case PJSIP_SC_OK:
-                sbc_response_code_send(rdata, PJSIP_SC_OK);
-                break;
+                case PJSIP_SC_OK:
+                    sbc_response_code_send(rdata, PJSIP_SC_OK, call_id);
+                    break;
 
-            default:
-                PJ_LOG(3, (THIS_FILE, "response not found\n"));
+                default:
+                    PJ_LOG(3, (THIS_FILE, "response not found\n"));
+            }
+        }
+        else
+        {
+            PJ_LOG(6, (THIS_FILE, "session A<->SBC already TERMINATED\n"));
+            return PJ_FALSE;
         }
     }
-    else
-    {
-        PJ_LOG(6, (THIS_FILE, "session A<->SBC already TERMINATED\n"));
-        return PJ_FALSE;
+    else {
+        PJ_LOG(3, (THIS_FILE, "Invalid call_id\n"));
     }
     return PJ_TRUE;
 }
@@ -657,6 +781,7 @@ static void call_on_state_changed( pjsip_inv_session *inv, pjsip_event *e)
     pj_status_t         status;
     pjsip_tx_data       *p_tdata;
     PJ_UNUSED_ARG(e);
+    sbc_data *call = (sbc_data*)inv->mod_data[0];
 
     if (inv->state == PJSIP_INV_STATE_DISCONNECTED) 
     {
@@ -666,35 +791,38 @@ static void call_on_state_changed( pjsip_inv_session *inv, pjsip_event *e)
 
         PJ_LOG(6, (THIS_FILE, "INV role: %s", inv->role));
 
-        if (inv == sbc_var[0].g_inv && sbc_var[0].g_out) 
+        if (inv == sbc_var[call->call_id].g_inv && sbc_var[call->call_id].g_out) 
         {
             PJ_LOG(3, (THIS_FILE, "A sent BYE SBC, SBC sent BYE B"));
 
-            status = pjsip_inv_end_session(sbc_var[0].g_out, inv->cause, NULL, &p_tdata);
+            status = pjsip_inv_end_session(sbc_var[call->call_id].g_out, inv->cause, NULL, &p_tdata);
             if (status != PJ_SUCCESS)
                 sbc_perror(THIS_FILE, "Error end_session()", status);
 
-            status = pjsip_inv_send_msg(sbc_var[0].g_out, p_tdata);
+            status = pjsip_inv_send_msg(sbc_var[call->call_id].g_out, p_tdata);
             if (status != PJ_SUCCESS)
                 sbc_perror(THIS_FILE, "Error sent BYE to B", status);
 
-            do
+           /*  do
             {
-                status = pjsip_inv_dec_ref(sbc_var[0].g_inv);
+                status = pjsip_inv_dec_ref(sbc_var[call->call_id].g_inv);
             }
-            while (status != PJ_EGONE);
-            sbc_var[0].g_inv = NULL;
-            PJ_LOG(6, (THIS_FILE, "g_inv is destroyed\n"));
+            while (status != PJ_EGONE); */
         }
 
         /* clean inv session */
-            do
-            {
-                status = pjsip_inv_dec_ref(sbc_var[0].g_inv);
-            }
-            while (status != PJ_EGONE);
-            sbc_var[0].g_inv = NULL;
-            PJ_LOG(6, (THIS_FILE, "g_inv is destroyed\n"));
+        /* do
+        {
+            status = pjsip_inv_dec_ref(sbc_var[call->call_id].g_out);
+        }
+        while (status != PJ_EGONE); */
+
+       
+        int idx = vector_search_index_by_int_call_id(&call_id_table, call->call_id);
+        if (idx != INVALID_ID && idx < MAX_DLG_CNT) {
+            vector_delete(&call_id_table, idx);
+        }
+        free_call_id(call->call_id);
     }
 
     PJ_LOG(3,(THIS_FILE, "Call state changed to %s", pjsip_inv_state_name(inv->state)));
@@ -706,6 +834,21 @@ static void call_on_forked(pjsip_inv_session *inv, pjsip_event *e)
     /* To be done... */
     PJ_UNUSED_ARG(inv);
     PJ_UNUSED_ARG(e);
+}
+
+static void call_on_media_update( pjsip_inv_session *inv, pj_status_t status)
+{
+    sbc_data* call = (sbc_data*)inv->mod_data[0];
+   
+    if (status != PJ_SUCCESS) {
+
+        sbc_perror(THIS_FILE, "SDP negotiation has failed", status);
+
+        /* Here we should disconnect call if we're not in the middle 
+        * of initializing an UAS dialog and if this is not a re-INVITE.
+        */
+        return;
+    }
 }
 
 /* Notification on outgoing messages */
@@ -789,11 +932,11 @@ static int alloc_call_id(void)
     int cid;
 
     /* New algorithm: round-robin */
-    if (next_call_id >= MAX_CALLS || next_call_id < 0) {
+    if (next_call_id >= MAX_DLG_CNT || next_call_id < 0) {
 	    next_call_id = 0;
     }
 
-    for ( cid = next_call_id; cid < MAX_CALLS; ++cid) {
+    for ( cid = next_call_id; cid < MAX_DLG_CNT; ++cid) {
         //if (calls[cid].inv == NULL && calls[cid].async_call.dlg == NULL) {
         if (sbc_var[cid].is_busy == PJ_FALSE) {
             ++next_call_id;
@@ -812,3 +955,59 @@ static int alloc_call_id(void)
     return INVALID_ID;
 }
 
+static void free_call_id(int call_id) {
+    sbc_var[call_id].is_busy = PJ_FALSE;
+    sbc_var[call_id].g_inv = NULL;
+    PJ_LOG(6, (THIS_FILE, "g_inv is destroyed\n"));
+    sbc_var[call_id].g_out = NULL;
+    PJ_LOG(6, (THIS_FILE, "g_out is destroyed\n"));
+    sbc_var[call_id].call_id = INVALID_ID;    
+}
+
+void vector_init(vector *v)
+{
+    //initialize the capacity and allocate the memory
+    v->capacity = VECTOR_INIT_CAPACITY;
+    v->size = 0;
+    v->items = malloc(sizeof(void *) * v->capacity);
+}
+
+void* vector_search_by_sip_call_id(vector *v, const char *sip_cid) 
+{
+    for (int i = 0; i < vector_size(v); ++i) {
+        call_id_data *cid = (call_id_data*)vector_get(v, i);
+        if (cid->sip_call_id_a && !strcmp(cid->sip_call_id_a, sip_cid) ||
+            cid->sip_call_id_b && !strcmp(cid->sip_call_id_b, sip_cid)) {
+            return cid;
+        }
+    }
+    return NULL;
+}
+
+void* vector_search_by_int_call_id(vector *v, int i_cid) 
+{
+    for (int i = 0; i < vector_size(v); ++i) {
+        call_id_data *cid = (call_id_data*)vector_get(v, i);
+        if (cid->int_call_id == i_cid) {
+            return cid;
+        }
+    }
+    return NULL;
+}
+
+int vector_search_index_by_int_call_id(vector *v, int i_cid) 
+{
+    for (int i = 0; i < vector_size(v); ++i) {
+        call_id_data *cid = (call_id_data*)vector_get(v, i);
+        if (cid->int_call_id == i_cid) {
+            return i;
+        }
+    }
+    return INVALID_ID;
+}
+
+static void str_malloc(pj_str_t src, char **dst, size_t len) {
+    *dst = (char*)malloc(sizeof(char) * (src.slen+1));
+    strncpy(*dst, src.ptr, len);
+    (*dst)[src.slen] = '\0';
+}
