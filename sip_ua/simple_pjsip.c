@@ -3,7 +3,7 @@
  *  - To make outgoing call, start simpleua with the URL of remote
  *    destination to contact.
  *    E.g.:
- *	 simpleua sip:user@remote
+ *	 simpleua sip:user@remote [dst URI] [local IP] [SIP port] [RTP port]
  *
  *  - Incoming calls will automatically be answered with 180, then 200.
  *
