@@ -13,8 +13,9 @@ pj_mutex_t		*mutex;	    /**< Mutex protection for this data	*/
 unsigned		 mutex_nesting_level; /**< Mutex nesting level.	*/
 pj_thread_t		*mutex_owner; /**< Mutex owner.			*/
 
-char *visible_nick = "<sip:vlbrazhnikov@10.25.72.40:7777>";
+char *visible_nick[2] = {"<sip:vlbrazhnikov@10.25.72.40:7779>", "<sip:vlbrazhnikov@10.25.72.60:8779>"};
 
+static int dialog_counter = 0;
 
 PJ_INLINE(void) PJCUSTOM_LOCK()
 {
@@ -211,10 +212,10 @@ static pj_status_t address_init(void) {
     dlg_addresses[0].sbc_port = 7777;
     dlg_addresses[0].rtp_port = 8000;
 
-    strcpy(dlg_addresses[1].uas_addr, "10.25.72.30");
+    strcpy(dlg_addresses[1].uas_addr, "10.25.72.50");
     strcpy(dlg_addresses[1].uac_addr, "10.25.72.60");
-    //strcpy(dlg_addresses[1].route_addr, "<sip:ilya@10.25.72.27:5060>");
-    strcpy(dlg_addresses[1].route_addr, "<sip:1133@10.25.72.100:5062>");
+    strcpy(dlg_addresses[1].route_addr, "<sip:ilya@10.25.72.27:5060>");
+    //strcpy(dlg_addresses[1].route_addr, "<sip:1133@10.25.72.100:5062>");
     dlg_addresses[1].sbc_port = 8777;
     dlg_addresses[1].rtp_port = 9000;
 
@@ -264,10 +265,10 @@ static pj_status_t sbc_global_endpt_create(void)
     status = pjsip_endpt_create(&cash_pool.factory, endpt_name, &g_endpt);
     if (status != PJ_SUCCESS)
     {
-        sbc_perror(THIS_FILE, "Global endpt not create!", status);
+        sbc_perror(THIS_FILE, "Global endpt has not created!", status);
     }
 
-    PJ_LOG(3, (THIS_FILE, "Global endpoint create!\n"));
+    PJ_LOG(3, (THIS_FILE, "Global endpoint has created!\n"));
 
     return status;
 }
@@ -375,7 +376,8 @@ static pj_bool_t sbc_invite_handler(pjsip_rx_data *rdata)
         }
         return PJ_TRUE;
     }
-   
+
+    
     PJCUSTOM_LOCK();
 
     // Find free call slot
@@ -539,7 +541,7 @@ static pj_bool_t sbc_request_inv_send(pjsip_rx_data *rdata, int call_id)
 
     
     //pj_str_t            local_uri = pj_str("<sip:vlbrazhnikov@10.25.72.40:7777>");
-    pj_str_t            local_uri = pj_str(visible_nick);
+    pj_str_t            local_uri = pj_str(visible_nick[call_id]);
     pj_str_t            dest_uri = pj_str(dlg_addresses[call_id].route_addr);
 
     sbc_data *call = (sbc_data*) rdata->endpt_info.mod_data[0];
@@ -617,6 +619,8 @@ static pj_bool_t sbc_request_inv_send(pjsip_rx_data *rdata, int call_id)
 
     PJCUSTOM_UNLOCK();
 
+
+    printf("\n******************************* Creation of INVITE request, call id: %d\n\n", call_id);
     /*
      * Create INVITE request 
      */
@@ -692,6 +696,12 @@ static pj_bool_t sbc_response_code_send(pjsip_rx_data * rdata, unsigned code, in
  */
 static pj_bool_t on_rx_request( pjsip_rx_data *rdata )
 {
+    /* dialog_counter++;
+    if (dialog_counter > 1) {
+        printf("\n2nd call");
+        dialog_counter++;
+        dialog_counter--;
+    } */
     // pj_status_t status;
     switch (rdata->msg_info.msg->line.req.method.id)
     {
@@ -726,8 +736,8 @@ static pj_bool_t on_rx_response( pjsip_rx_data *rdata)
         call_id = cid->int_call_id;
     }
 
-    //free(sip_call_id);
-    //sip_call_id = NULL;
+    free(sip_call_id);
+    sip_call_id = NULL;
 
     PJCUSTOM_UNLOCK();
 
@@ -743,7 +753,9 @@ static pj_bool_t on_rx_response( pjsip_rx_data *rdata)
                 case PJSIP_SC_OK:
                     sbc_response_code_send(rdata, PJSIP_SC_OK, call_id);
                     break;
-
+                case PJSIP_SC_DECLINE:
+                    sbc_response_code_send(rdata, PJSIP_SC_DECLINE, call_id);
+                    break;
                 default:
                     PJ_LOG(3, (THIS_FILE, "response not found\n"));
             }
@@ -808,6 +820,17 @@ static void call_on_state_changed( pjsip_inv_session *inv, pjsip_event *e)
                 status = pjsip_inv_dec_ref(sbc_var[call->call_id].g_inv);
             }
             while (status != PJ_EGONE); */
+        }
+        else if (inv == sbc_var[call->call_id].g_out && sbc_var[call->call_id].g_inv) {
+            PJ_LOG(3, (THIS_FILE, "B sent BYE SBC, SBC sent BYE A"));
+
+            status = pjsip_inv_end_session(sbc_var[call->call_id].g_inv, inv->cause, NULL, &p_tdata);
+            if (status != PJ_SUCCESS)
+                sbc_perror(THIS_FILE, "Error end_session()", status);
+
+            status = pjsip_inv_send_msg(sbc_var[call->call_id].g_inv, p_tdata);
+            if (status != PJ_SUCCESS)
+                sbc_perror(THIS_FILE, "Error sent BYE to A", status);
         }
 
         /* clean inv session */
