@@ -15,8 +15,6 @@ pj_thread_t		*mutex_owner; /**< Mutex owner.			*/
 
 char *visible_nick[2] = {"<sip:vlbrazhnikov@10.25.72.40:7779>", "<sip:vlbrazhnikov@10.25.72.60:8779>"};
 
-static int dialog_counter = 0;
-
 PJ_INLINE(void) PJCUSTOM_LOCK()
 {
     pj_mutex_lock(mutex);
@@ -45,7 +43,6 @@ sbc_data *sbc_var = NULL;               // указатель на глобал�
 static vector call_id_table;
 
 dlg_addr_data *dlg_addresses = NULL;
-
 
 
 /* Init PJSIP module to be registered by application to handle
@@ -221,6 +218,7 @@ static pj_status_t address_init(void) {
 
     return PJ_SUCCESS;
 }
+
 /* init application data */
 static pj_status_t sbc_init(void)
 {
@@ -382,7 +380,6 @@ static pj_bool_t sbc_invite_handler(pjsip_rx_data *rdata)
 
     // Find free call slot
     int call_id = alloc_call_id();
-
     if (call_id == INVALID_ID) {
         pjsip_endpt_respond_stateless(g_endpt, rdata,
                         PJSIP_SC_BUSY_HERE, NULL,
@@ -439,8 +436,12 @@ static pj_bool_t sbc_invite_handler(pjsip_rx_data *rdata)
     /*
      * Get host URI
      */
-
-    local_uri = pj_str(/*temp*/"<sip:abc@10.25.72.30:7777>");
+    
+    char tmp[100];
+    sprintf(tmp, "<sip:abc@%s:%d>", dlg_addresses[call_id].uas_addr, dlg_addresses[call_id].sbc_port);
+    //local_uri = pj_str(/*temp*/"<sip:abc@10.25.72.30:7777>");
+    local_uri = pj_str(tmp);
+    
     PJ_LOG(3, (THIS_FILE, "UAS IP addr: %s, \n", local_uri));
 
     /*
@@ -539,8 +540,6 @@ static pj_bool_t sbc_request_inv_send(pjsip_rx_data *rdata, int call_id)
      * Set route to direct for SBC
      */
 
-    
-    //pj_str_t            local_uri = pj_str("<sip:vlbrazhnikov@10.25.72.40:7777>");
     pj_str_t            local_uri = pj_str(visible_nick[call_id]);
     pj_str_t            dest_uri = pj_str(dlg_addresses[call_id].route_addr);
 
@@ -619,8 +618,6 @@ static pj_bool_t sbc_request_inv_send(pjsip_rx_data *rdata, int call_id)
 
     PJCUSTOM_UNLOCK();
 
-
-    printf("\n******************************* Creation of INVITE request, call id: %d\n\n", call_id);
     /*
      * Create INVITE request 
      */
@@ -657,37 +654,38 @@ static pj_bool_t sbc_response_code_send(pjsip_rx_data * rdata, unsigned code, in
        4) create response for session
        5) send response for session
      */
-    status = pjsip_inv_initial_answer(sbc_var[call_id].g_inv, sbc_var[call_id].new_rdata, code, NULL, NULL, &p_tdata);
-    if (status != PJ_SUCCESS)
-        sbc_perror(THIS_FILE, "Error in pjsip_inv_initial_answer", status);
-
-    if (code == PJSIP_SC_OK)
-    {
-        sdp_info_b = pjsip_rdata_get_sdp_info(rdata);
-        status = pjsip_create_sdp_body(p_tdata->pool, 
-                                sdp_info_b->sdp,
-                                &p_body);
+    if (sbc_var[call_id].g_inv->invite_tsx && sbc_var[call_id].g_inv->state != PJSIP_INV_STATE_DISCONNECTED) {
+        status = pjsip_inv_initial_answer(sbc_var[call_id].g_inv, sbc_var[call_id].new_rdata, code, NULL, NULL, &p_tdata);
         if (status != PJ_SUCCESS)
-            sbc_perror(THIS_FILE, "Error in create_sdp_body", status);
+            sbc_perror(THIS_FILE, "Error in pjsip_inv_initial_answer", status);
 
-        /* set new body */
-        pj_size_t size = 400;
-        char buf[size];
-        p_tdata->msg->body = p_body;
-        p_tdata->msg->body->print_body(p_tdata->msg->body, buf, size);
-        PJ_LOG(3, (THIS_FILE, "%s, len: %lu", buf, size));
+        if (code == PJSIP_SC_OK)
+        {
+            sdp_info_b = pjsip_rdata_get_sdp_info(rdata);
+            status = pjsip_create_sdp_body(p_tdata->pool, 
+                                    sdp_info_b->sdp,
+                                    &p_body);
+            if (status != PJ_SUCCESS)
+                sbc_perror(THIS_FILE, "Error in create_sdp_body", status);
 
-        /*
-         * Free cloned rdata for UAS
-         */
-        status = pjsip_rx_data_free_cloned(sbc_var[call_id].new_rdata);
-        if (status != PJ_SUCCESS)
-            sbc_perror(THIS_FILE, "RX not FREE!", status);
+            /* set new body */
+            pj_size_t size = 400;
+            char buf[size];
+            p_tdata->msg->body = p_body;
+            p_tdata->msg->body->print_body(p_tdata->msg->body, buf, size);
+            PJ_LOG(3, (THIS_FILE, "%s, len: %lu", buf, size));
+
+            /*
+            * Free cloned rdata for UAS
+            */
+            status = pjsip_rx_data_free_cloned(sbc_var[call_id].new_rdata);
+            if (status != PJ_SUCCESS)
+                sbc_perror(THIS_FILE, "RX not FREE!", status);
+        }
+
+        // Send response to A side
+        status = pjsip_inv_send_msg(sbc_var[call_id].g_inv, p_tdata);
     }
-
-    // Send response to A side
-    status = pjsip_inv_send_msg(sbc_var[call_id].g_inv, p_tdata);
-
     return PJ_TRUE;
 }
 
@@ -696,13 +694,6 @@ static pj_bool_t sbc_response_code_send(pjsip_rx_data * rdata, unsigned code, in
  */
 static pj_bool_t on_rx_request( pjsip_rx_data *rdata )
 {
-    /* dialog_counter++;
-    if (dialog_counter > 1) {
-        printf("\n2nd call");
-        dialog_counter++;
-        dialog_counter--;
-    } */
-    // pj_status_t status;
     switch (rdata->msg_info.msg->line.req.method.id)
     {
         case PJSIP_INVITE_METHOD:
