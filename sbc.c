@@ -4,9 +4,20 @@
 #define MAX_CALLS 20
 #define INVALID_ID -1
 
-pj_caching_pool          cash_pool;      /* Global pool factory */
-pjsip_endpoint           *g_endpt;       /* SIP endpoint        */
-pjmedia_endpt	    *g_med_endpt;   /* Media endpoint.		*/
+static pj_caching_pool          cash_pool;      /* Global pool factory */
+
+static pjsip_endpoint           *g_endpt;       /* SIP endpoint        */
+
+static pjmedia_endpt	    *g_med_endpt;   /* Media endpoint.		*/
+
+static pjmedia_transport_info g_med_tpinfo[MAX_MEDIA_CNT]; 
+					    /* Socket info for media	*/
+static pjmedia_transport    *g_med_transport[MAX_MEDIA_CNT];
+					    /* Media stream transport	*/
+static pjmedia_sock_info     g_sock_info[MAX_MEDIA_CNT];  
+					    /* Socket info array	*/
+
+pjmedia_conf                *conf;      // Conference bridge
 
 int next_call_id = 0;		/**< Next call id to use*/
 pj_mutex_t		*mutex;	    /**< Mutex protection for this data	*/
@@ -120,6 +131,12 @@ static pj_status_t main_init(void)
     pj_status_t status; 
     pj_pool_t *pool = NULL;
 
+    int clock_rate = CLOCK_RATE;
+    int channel_count = NCHANNELS;
+    int samples_per_frame = NSAMPLES;
+    int bits_per_sample = NBITS;
+    int port_count = 25;
+
     sbc_var = (sbc_data*)malloc(sizeof(sbc_data) * SBC_DLG_MAX_CNT);
    
     vector_init(&call_id_table);
@@ -179,6 +196,14 @@ static pj_status_t main_init(void)
     /* Create pool. */
     pool = pjmedia_endpt_create_pool(g_med_endpt, "Media pool", 512, 512);	
 
+    /* 
+     * Add PCMA/PCMU codec to the media endpoint. 
+    */
+#if defined(PJMEDIA_HAS_G711_CODEC) && PJMEDIA_HAS_G711_CODEC!=0
+    status = pjmedia_codec_g711_init(g_med_endpt);
+    PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
+#endif
+
         /* Create mutex */
     status = pj_mutex_create_recursive(pool, "simple_pjsip", 
 				       &mutex);
@@ -191,6 +216,54 @@ static pj_status_t main_init(void)
             mutex = NULL;
         }
         return status;
+    }
+
+    /* Create the conference bridge. 
+     * With default options (zero), the bridge will create an instance of
+     * sound capture and playback device and connect them to slot zero.
+     */
+    status = pjmedia_conf_create( pool,	    /* pool to use	    */
+				  port_count,/* number of ports	    */
+				  clock_rate,
+				  channel_count,
+				  samples_per_frame,
+				  bits_per_sample,
+				  0,	    /* options		    */
+				  &conf	    /* result		    */
+				  );
+    if (status != PJ_SUCCESS) {
+    sbc_perror(THIS_FILE, "Unable to create conference bridge", status);
+	return 1;
+    }
+  
+    /* Create event manager */
+    status = pjmedia_event_mgr_create(pool, 0, NULL);
+    PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
+
+    /* 
+     * Create media transport used to send/receive RTP/RTCP socket.
+     * One media transport is needed for each call. Application may
+     * opt to re-use the same media transport for subsequent calls.
+     */
+    for (int i = 0; i < PJ_ARRAY_SIZE(g_med_transport); ++i) {
+        status = pjmedia_transport_udp_create3(g_med_endpt, AF, NULL, NULL, 
+                            RTP_PORT + i*2, 0, 
+                            &g_med_transport[i]);
+        if (status != PJ_SUCCESS) {
+            sbc_perror(THIS_FILE, "Unable to create media transport", status);
+            return 1;
+        }
+
+        /* 
+        * Get socket info (address, port) of the media transport. We will
+        * need this info to create SDP (i.e. the address and port info in
+        * the SDP).
+        */
+        pjmedia_transport_info_init(&g_med_tpinfo[i]);
+        pjmedia_transport_get_info(g_med_transport[i], &g_med_tpinfo[i]);
+
+        pj_memcpy(&g_sock_info[i], &g_med_tpinfo[i].sock_info,
+            sizeof(pjmedia_sock_info));
     }
 
     return status;
@@ -588,7 +661,7 @@ static pj_bool_t sbc_request_inv_send(pjsip_rx_data *rdata, int call_id)
      * Create the INVITE session for B side
      */
 
-    status = pjsip_inv_create_uac(uac_dlg, NULL, 0, &sbc_var[call_id].g_out);
+    status = pjsip_inv_create_uac(uac_dlg, NULL, 0, &(call->g_out));
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, 1);
     
     /*
@@ -794,15 +867,15 @@ static void call_on_state_changed( pjsip_inv_session *inv, pjsip_event *e)
 
         PJ_LOG(6, (THIS_FILE, "INV role: %s", inv->role));
 
-        if (inv == sbc_var[call->call_id].g_inv && sbc_var[call->call_id].g_out) 
+        if (inv == call->g_inv && call->g_out) 
         {
             PJ_LOG(3, (THIS_FILE, "A sent BYE SBC, SBC sent BYE B"));
 
-            status = pjsip_inv_end_session(sbc_var[call->call_id].g_out, inv->cause, NULL, &p_tdata);
+            status = pjsip_inv_end_session(call->g_out, inv->cause, NULL, &p_tdata);
             if (status != PJ_SUCCESS)
                 sbc_perror(THIS_FILE, "Error end_session()", status);
 
-            status = pjsip_inv_send_msg(sbc_var[call->call_id].g_out, p_tdata);
+            status = pjsip_inv_send_msg(call->g_out, p_tdata);
             if (status != PJ_SUCCESS)
                 sbc_perror(THIS_FILE, "Error sent BYE to B", status);
 
@@ -812,14 +885,14 @@ static void call_on_state_changed( pjsip_inv_session *inv, pjsip_event *e)
             }
             while (status != PJ_EGONE); */
         }
-        else if (inv == sbc_var[call->call_id].g_out && sbc_var[call->call_id].g_inv) {
+        else if (inv == call->g_out && call->g_inv) {
             PJ_LOG(3, (THIS_FILE, "B sent BYE SBC, SBC sent BYE A"));
 
-            status = pjsip_inv_end_session(sbc_var[call->call_id].g_inv, inv->cause, NULL, &p_tdata);
+            status = pjsip_inv_end_session(call->g_inv, inv->cause, NULL, &p_tdata);
             if (status != PJ_SUCCESS)
                 sbc_perror(THIS_FILE, "Error end_session()", status);
 
-            status = pjsip_inv_send_msg(sbc_var[call->call_id].g_inv, p_tdata);
+            status = pjsip_inv_send_msg(call->g_inv, p_tdata);
             if (status != PJ_SUCCESS)
                 sbc_perror(THIS_FILE, "Error sent BYE to A", status);
         }
@@ -831,7 +904,38 @@ static void call_on_state_changed( pjsip_inv_session *inv, pjsip_event *e)
         }
         while (status != PJ_EGONE); */
 
-       
+        if (call->med_stream_a) {
+            status = pjmedia_stream_send_rtcp_bye(call->med_stream_a);
+            status = pjmedia_conf_remove_port(conf, call->conf_slot_a);
+        }
+
+        if (call->med_stream_b) {
+            status = pjmedia_stream_send_rtcp_bye(call->med_stream_b);
+            status = pjmedia_conf_remove_port(conf, call->conf_slot_b);
+        }
+
+        /* Destroy port */
+        if(call->media_port_a) {
+            pjmedia_port_destroy(call->media_port_a);
+            call->media_port_a = NULL;
+        }
+
+        if(call->media_port_b) {
+            pjmedia_port_destroy(call->media_port_b);
+            call->media_port_b = NULL;
+        }
+
+        /* Destroy streams */
+        if (call->med_stream_b){
+            pjmedia_stream_destroy(call->med_stream_b);
+            call->med_stream_b = NULL;
+        }
+
+        if (call->med_stream_a){
+            pjmedia_stream_destroy(call->med_stream_a);
+            call->med_stream_a = NULL;
+        }
+
         int idx = vector_search_index_by_int_call_id(&call_id_table, call->call_id);
         if (idx != INVALID_ID && idx < MAX_DLG_CNT) {
             vector_delete(&call_id_table, idx);
@@ -852,16 +956,170 @@ static void call_on_forked(pjsip_inv_session *inv, pjsip_event *e)
 
 static void call_on_media_update( pjsip_inv_session *inv, pj_status_t status)
 {
+    pjmedia_stream_info stream_info_a, stream_info_b;
+    const pjmedia_sdp_session *local_sdp_a, *local_sdp_b;
+    const pjmedia_sdp_session *remote_sdp_a, *remote_sdp_b;
+    pjmedia_port *media_port_a, *media_port_b;
+
+    printf("\nInv name: %s\n\n", inv->obj_name);
+    int user_slot_a = -1, user_slot_b = -1;
+
+    pjsip_inv_session *inv_a, *inv_b; 
+
     sbc_data* call = (sbc_data*)inv->mod_data[0];
-   
-    if (status != PJ_SUCCESS) {
 
-        sbc_perror(THIS_FILE, "SDP negotiation has failed", status);
+    if (call) {
+        inv_a = call->g_inv;
+        inv_b = call->g_out;
 
-        /* Here we should disconnect call if we're not in the middle 
-        * of initializing an UAS dialog and if this is not a re-INVITE.
+        call_id_data *cid = (call_id_data*) vector_search_by_int_call_id(&call_id_table, call->call_id);
+
+        if (!(cid->sip_call_id_a && cid->sip_call_id_b)) {
+            sbc_perror(THIS_FILE, "Both invite session have to be initialized!", status);
+            return;
+        }
+        if (!(cid->sip_call_id_b)) {
+            sbc_perror(THIS_FILE, "B invite session have to be initialized!", status);
+            return;
+        }
+        if (status != PJ_SUCCESS) {
+
+            sbc_perror(THIS_FILE, "SDP negotiation has failed", status);
+
+            /* Here we should disconnect call if we're not in the middle 
+            * of initializing an UAS dialog and if this is not a re-INVITE.
+            */
+            return;
+        }
+
+        /* Get local and remote SDP.
+        * We need both SDPs to create a media session.
         */
-        return;
+        if (!(inv_a->neg && inv_b->neg)) { 
+            return;
+        }
+        
+        pjmedia_sdp_neg_state state_a = pjmedia_sdp_neg_get_state(inv_a->neg);
+        pjmedia_sdp_neg_state state_b = pjmedia_sdp_neg_get_state(inv_b->neg);
+
+
+        if (! (state_a == PJMEDIA_SDP_NEG_STATE_DONE && state_b == PJMEDIA_SDP_NEG_STATE_DONE)) {
+            return;
+        }
+        if (state_b != PJMEDIA_SDP_NEG_STATE_DONE ) {
+            return;
+        }
+
+        status = pjmedia_sdp_neg_get_active_local(inv_a->neg, &local_sdp_a);
+        status = pjmedia_sdp_neg_get_active_remote(inv_a->neg, &remote_sdp_a);
+
+        status = pjmedia_sdp_neg_get_active_local(inv_b->neg, &local_sdp_b);
+
+        if (status != PJ_SUCCESS) {
+            sbc_perror(THIS_FILE,"Unable to get active local",status);
+            return;
+        }
+
+        status = pjmedia_sdp_neg_get_active_remote(inv_b->neg, &remote_sdp_b);
+
+        if (status != PJ_SUCCESS) {
+            sbc_perror(THIS_FILE,"Unable to get active remote",status);
+            return;
+        }
+         /* Create stream info based on the media audio SDP. */
+        status = pjmedia_stream_info_from_sdp(&stream_info_a, inv_a->dlg->pool,
+                        g_med_endpt,
+                        local_sdp_a, remote_sdp_a, 0);
+        
+        if (status != PJ_SUCCESS) {
+            sbc_perror(THIS_FILE,"Unable to create audio stream info",status);
+            return;
+        }
+
+        status = pjmedia_stream_info_from_sdp(&stream_info_b, inv_b->dlg->pool,
+                        g_med_endpt,
+                        local_sdp_b, remote_sdp_b, 0);
+        
+        if (status != PJ_SUCCESS) {
+            sbc_perror(THIS_FILE,"Unable to create audio stream info",status);
+            return;
+        }
+        
+
+        /* If required, we can also change some settings in the stream info,
+        * (such as jitter buffer settings, codec settings, etc) before we
+        * create the stream.
+        */
+
+        /* Create new audio media stream, passing the stream info, and also the
+        * media socket that we created earlier.
+        */
+        status = pjmedia_stream_create(g_med_endpt, inv_a->dlg->pool, &stream_info_a,
+                    g_med_transport[0], NULL, &call->med_stream_a);
+        if (status != PJ_SUCCESS) {
+            sbc_perror( THIS_FILE, "Unable to create audio stream", status);
+            return;
+        }
+
+        status = pjmedia_stream_create(g_med_endpt, inv_b->dlg->pool, &stream_info_b,
+                    g_med_transport[0], NULL, &call->med_stream_b);
+        if (status != PJ_SUCCESS) {
+            sbc_perror( THIS_FILE, "Unable to create audio stream", status);
+            return;
+        }
+
+        /* Start the audio stream */
+        status = pjmedia_stream_start(call->med_stream_a);
+        if (status != PJ_SUCCESS) {
+            sbc_perror( THIS_FILE, "Unable to start audio stream", status);
+            return;
+        }
+
+        status = pjmedia_stream_start(call->med_stream_b);
+        if (status != PJ_SUCCESS) {
+            sbc_perror( THIS_FILE, "Unable to start audio stream", status);
+            return;
+        }
+
+        /* Start the UDP media transport */
+        pjmedia_transport_media_start(g_med_transport[0], 0, 0, 0, 0);
+
+        /* Get the media port interface of the audio stream. 
+        * Media port interface is basicly a struct containing get_frame() and
+        * put_frame() function. With this media port interface, we can attach
+        * the port interface to conference bridge, or directly to a sound
+        * player/recorder device.
+        */
+        pjmedia_stream_get_port(call->med_stream_a, &media_port_a);
+
+        pjmedia_stream_get_port(call->med_stream_b, &media_port_b);
+
+        status = pjmedia_conf_add_port(conf, inv_a->dlg->pool, media_port_a, NULL, &user_slot_a);
+
+         if (status != PJ_SUCCESS) {
+            sbc_perror( THIS_FILE, "Unable to add port", status);
+            return;
+        }
+
+        status = pjmedia_conf_add_port(conf, inv_b->dlg->pool, media_port_b, NULL, &user_slot_b);
+
+         if (status != PJ_SUCCESS) {
+            sbc_perror( THIS_FILE, "Unable to add port", status);
+            return;
+        }
+
+        call->media_port_a = media_port_a;
+        call->conf_slot_a = user_slot_a;
+
+        call->media_port_b = media_port_b;
+        call->conf_slot_b = user_slot_b;
+
+        status = pjmedia_conf_connect_port(conf, user_slot_a, user_slot_b, 0);
+
+        if (status != PJ_SUCCESS) {
+            sbc_perror( THIS_FILE, "Unable to connect port", status);
+            return;
+        }
     }
 }
 

@@ -23,7 +23,11 @@
 #define MAX_MEDIA_CNT       1        /* Media count, set to 1 for aud 2 for aud & video */
 #define TIMEOUT_EVENTS_MS   5000
 
-
+/* Constants of conference bridge */
+#define CLOCK_RATE	44100
+#define NSAMPLES	(CLOCK_RATE * 20 / 1000)
+#define NCHANNELS	1
+#define NBITS		16
 
 struct dlg_addr_data {
     char uas_addr[16];
@@ -42,6 +46,13 @@ typedef struct sbc_data {
     pjsip_rx_data            *new_rdata;
     int                      call_id;
     pj_bool_t                is_busy;
+
+    pjmedia_port             *media_port_a;   /* A media port */
+    pjmedia_port             *media_port_b;   /* B media port */
+    int                      conf_slot_a;     /* Conference bridge slot for A side */
+    int                      conf_slot_b;     /* Conference bridge slot for B side */
+    pjmedia_stream           *med_stream_a;   /* Call's audio streams (A side) */
+    pjmedia_stream           *med_stream_b;   /* Call's audio streams (B side) */
 } sbc_data;
 
 typedef struct call_id_data {
